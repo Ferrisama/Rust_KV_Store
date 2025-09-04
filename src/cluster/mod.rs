@@ -4,12 +4,20 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize};
 use log::info;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ClusterNode {
     pub id: String,
     pub address: String,
+}
+
+#[derive(Serialize)]
+pub struct ClusterStats {
+    pub total_nodes: usize,
+    pub virtual_nodes_per_node: usize,
+    pub total_virtual_nodes: usize,
 }
 
 pub struct Cluster {
@@ -49,6 +57,21 @@ impl Cluster {
         virtual_nodes.retain(|_, id| id != node_id);
     }
 
+    pub async fn get_nodes(&self) -> Vec<ClusterNode> {
+        self.nodes.read().await.clone()
+    }
+
+    pub async fn get_stats(&self) -> ClusterStats {
+        let nodes = self.nodes.read().await;
+        let virtual_nodes = self.virtual_nodes.read().await;
+        
+        ClusterStats {
+            total_nodes: nodes.len(),
+            virtual_nodes_per_node: self.virtual_node_count,
+            total_virtual_nodes: virtual_nodes.len(),
+        }
+    }
+
     pub async fn get_node_for_key(&self, key: &str) -> Option<(ClusterNode, ClusterNode)> {
         let nodes = self.nodes.read().await;
         let virtual_nodes = self.virtual_nodes.read().await;
@@ -58,32 +81,39 @@ impl Cluster {
         }
 
         let hash = self.hash(key);
-        let mut primary_virtual_node = u64::MAX;
-        let mut backup_virtual_node = u64::MAX;
+        let mut sorted_vnodes: Vec<u64> = virtual_nodes.keys().cloned().collect();
+        sorted_vnodes.sort();
 
-        for &vn in virtual_nodes.keys() {
-            if vn > hash && vn < primary_virtual_node {
-                backup_virtual_node = primary_virtual_node;
-                primary_virtual_node = vn;
-            } else if vn < backup_virtual_node {
-                backup_virtual_node = vn;
-            }
-        }
+        // Find the first virtual node that comes after our hash
+        let primary_vnode = sorted_vnodes
+            .iter()
+            .find(|&&vn| vn > hash)
+            .cloned()
+            .unwrap_or(sorted_vnodes[0]);
 
-        if primary_virtual_node == u64::MAX {
-            primary_virtual_node = *virtual_nodes.keys().min().unwrap();
-        }
-        if backup_virtual_node == u64::MAX {
-            backup_virtual_node = *virtual_nodes.keys().min().unwrap();
-        }
+        // Find the next virtual node for backup
+        let primary_idx = sorted_vnodes.iter().position(|&vn| vn == primary_vnode).unwrap();
+        let backup_vnode = sorted_vnodes[(primary_idx + 1) % sorted_vnodes.len()];
 
-        let primary_node_id = virtual_nodes.get(&primary_virtual_node).unwrap();
-        let backup_node_id = virtual_nodes.get(&backup_virtual_node).unwrap();
+        let primary_node_id = virtual_nodes.get(&primary_vnode)?;
+        let backup_node_id = virtual_nodes.get(&backup_vnode)?;
 
         let primary_node = nodes.iter().find(|node| &node.id == primary_node_id).cloned()?;
         let backup_node = nodes.iter().find(|node| &node.id == backup_node_id).cloned()?;
 
         Some((primary_node, backup_node))
+    }
+
+    pub async fn get_key_distribution(&self) -> Vec<(String, String)> {
+        let virtual_nodes = self.virtual_nodes.read().await;
+        let mut distribution: Vec<(String, String)> = Vec::new();
+        
+        for (hash, node_id) in virtual_nodes.iter() {
+            distribution.push((format!("{:016x}", hash), node_id.clone()));
+        }
+        
+        distribution.sort_by_key(|(hash, _)| hash.clone());
+        distribution
     }
 
     fn hash(&self, key: &str) -> u64 {

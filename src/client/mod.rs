@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use thiserror::Error;
 use std::future::Future;
 use std::pin::Pin;
+use serde::{Deserialize, Serialize};
 
 #[derive(Error, Debug)]
 pub enum ClientError {
@@ -16,6 +17,12 @@ pub enum ClientError {
     ServerError(String),
     #[error("Too many redirects")]
     TooManyRedirects,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct KeyValue {
+    pub key: String,
+    pub value: String,
 }
 
 pub struct Client {
@@ -39,16 +46,24 @@ impl Client {
                     Err(_) => continue,
                 };
 
-                stream.write_all(command.as_bytes()).await?;
+                if let Err(_) = stream.write_all(command.as_bytes()).await {
+                    continue;
+                }
 
                 let mut buffer = [0; 1024];
-                let n = stream.read(&mut buffer).await?;
+                let n = match stream.read(&mut buffer).await {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+
                 let response = String::from_utf8_lossy(&buffer[..n]).to_string();
 
                 if response.starts_with("REDIRECT:") {
-                    let new_address = response.strip_prefix("REDIRECT:").unwrap().to_string();
+                    let new_address = response.strip_prefix("REDIRECT:").unwrap().trim().to_string();
                     let mut new_addresses = self.addresses.clone();
-                    new_addresses.push(new_address);
+                    if !new_addresses.contains(&new_address) {
+                        new_addresses.push(new_address);
+                    }
                     let new_client = Client::new(new_addresses);
                     return new_client.send_command(command, redirects + 1).await;
                 }
@@ -57,7 +72,7 @@ impl Client {
                     return Err(ClientError::ServerError(response));
                 }
 
-                return Ok(response);
+                return Ok(response.trim().to_string());
             }
 
             Err(ClientError::ServerError("No available nodes".to_string()))
@@ -88,5 +103,15 @@ impl Client {
             "NOT_FOUND" => Ok(false),
             _ => Err(ClientError::ParseError),
         }
+    }
+
+    pub async fn list_keys(&self) -> Result<Vec<String>, ClientError> {
+        // This is a simplified implementation - in a real system you'd want to
+        // query all nodes and aggregate results
+        let response = self.send_command("LIST".to_string(), 0).await?;
+        if response == "NOT_IMPLEMENTED" {
+            return Ok(Vec::new());
+        }
+        Ok(response.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
     }
 }
